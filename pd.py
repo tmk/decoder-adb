@@ -39,17 +39,22 @@ class Decoder(srd.Decoder):
         ('lo', 'Low'),                  # 0
         ('hi', 'High'),                 # 1
         ('attn', 'Attention'),          # 2
-        ('reset', 'Global Reset'),      # 3
+        ('greset', 'Global Reset'),     # 3
         ('bit', 'Bit'),                 # 4
-        ('byte', 'Byte'),               # 5
+        ('data', 'Data'),               # 5
         ('start','Start'),              # 6
         ('stop','Stop'),                # 7
         ('srq','Service Request'),      # 8
+        ('reset', 'Reset'),             # 9
+        ('flush', 'Flush'),             # 10
+        ('listen', 'Listen'),           # 11
+        ('talk', 'Talk'),               # 12
+        ('unknown', 'Unknown'),         # 13
     )
     annotation_rows = (
         ('cells', 'Cells', (0,1,2,3,8)),
         ('bits', 'Bits', (4,6,7)),
-        ('bytes', 'Bytes', (5,)),
+        ('bytes', 'Bytes', (5,9,10,11,12,13)),
     )
 
     def __init__(self):
@@ -78,13 +83,29 @@ class Decoder(srd.Decoder):
         self.put(ss, es, self.out_ann, [2, ['Attn:%d' % self.to_us(es - ss), 'Attn', 'A']])
 
     def putr(self, ss, es):
-        self.put(ss, es, self.out_ann, [3, ['Reset:%d' % self.to_us(es - ss), 'RST', 'R']])
+        self.put(ss, es, self.out_ann, [3, ['Reset:%d' % self.to_us(es - ss), 'Rst', 'R']])
 
     def putb(self, ss, es, b):
-        self.put(ss, es, self.out_ann, [4, ['%d' % b]])
+        self.put(ss, es, self.out_ann, [4, ['%X' % b]])
 
-    def putB(self, ss, es, B):
-        self.put(ss, es, self.out_ann, [5, ['%02X' % B]])
+    def putD(self, ss, es, D):
+        self.put(ss, es, self.out_ann, [5, ['%02X' % D]])
+
+    def putC(self, ss, es, C):
+        addr = (C >> 4) & 0x0f
+        cmd = C & 0x0f
+        reg = C & 0x03
+        if (cmd == 0):
+            self.put(ss, es, self.out_ann, [9, ['Reset:%02X' % C, 'RST', 'R']])
+        elif (cmd == 1):
+            self.put(ss, es, self.out_ann, [10, ['Flush:%02X' % C, 'FLS', 'F']])
+        elif ((cmd & 0x0c) == 0x08):
+            self.put(ss, es, self.out_ann, [11, ['Listen($%X,r%d) %02X' % (addr, reg, C), 'L:%X:%d' % (addr, reg), 'L']])
+        elif ((cmd & 0x0c) == 0x0c):
+            self.put(ss, es, self.out_ann, [12, ['Talk($%X,r%d) %02X' % (addr, reg, C), 'T:%X:%d' % (addr, reg), 'T']])
+        else:
+            self.put(ss, es, self.out_ann, [13, ['Unknown:%02X' % C, 'Unk', 'U']])
+
 
     def putS(self, ss, es):
         self.put(ss, es, self.out_ann, [6, ['Start(1)', 'S1', 'S']])
@@ -92,7 +113,7 @@ class Decoder(srd.Decoder):
     def putT(self, ss, es):
         self.put(ss, es, self.out_ann, [7, ['Stop(0)', 'T0', 'T']])
 
-    def putq(self, ss, es):
+    def putQ(self, ss, es):
         self.put(ss, es, self.out_ann, [8, ['SRQ:%d' % self.to_us(es - ss), 'SRQ', 'Q']])
 
     def decode(self):
@@ -110,61 +131,69 @@ class Decoder(srd.Decoder):
         '''
         byte = 0
         bit_count = 0
+        attention = 0
         self.wait({0: 'f'})
         cell_s = self.samplenum
         while True:
             # low
             self.wait({0: 'r'})
             low_e = self.samplenum
-            len = self.to_us(low_e - cell_s)
-            if len < 100:
+            low = self.to_us(low_e - cell_s)
+            if low < 100:
                 # cell-low
                 self.putl(cell_s, low_e)
 
                 if bit_count % 8 == 0:
                     byte_s = cell_s
-            elif len > 1500:
+            elif low > 1500:
                 # global reset
                 self.putr(cell_s, low_e)
+            elif low > 500:
+                # attention(560-1040us)
+                self.puta(cell_s, low_e)
+                attention = 1
             else:
-                # 100 <= len < 1500
-                if bit_count == 8:
-                    # SRQ
-                    self.putq(cell_s, low_e)
-                else:
-                    # attention
-                    self.puta(cell_s, low_e)
-                bit_count = -1
-                byte = 0
+                # 100 <= low <= 500
+                # SRQ(140-260us) after command
+                self.putQ(cell_s, low_e)
 
             # high
             self.wait({0: 'f'})
             cell_e = self.samplenum
-
-            if self.to_us(cell_e - low_e) < 100:
+            high = self.to_us(cell_e - low_e)
+            cell = self.to_us(cell_e - cell_s)
+            if high < 100:
                 # cell-high
                 self.puth(low_e, cell_e)
 
-                if self.to_us(cell_e - cell_s) <= 130:
+                if cell <= 130:
                     # bit-cell  0:___-- 1:__---
                     bit_count += 1
-                    if (low_e - cell_s) > (cell_e - low_e):
-                        # bit0
-                        self.putb(cell_s, cell_e, 0)
-                        byte = ((byte << 1) & 0xff) | 0
-                    else:
-                        # bit 1
-                        self.putb(cell_s, cell_e, 1)
-                        byte = ((byte << 1) & 0xff) | 1
-
                     if bit_count == 0:
                         # start-bit(1) __---
                         self.putS(cell_s, cell_e)
-                    elif bit_count % 8 == 0:
+                    else:
+                        if low > high:
+                            # bit0
+                            self.putb(cell_s, cell_e, 0)
+                            byte = ((byte << 1) & 0xff) | 0
+                        else:
+                            # bit 1
+                            self.putb(cell_s, cell_e, 1)
+                            byte = ((byte << 1) & 0xff) | 1
+
+                    if bit_count and bit_count % 8 == 0:
                         # byte
-                        self.putB(byte_s, cell_e, byte)
+                        if attention == 1:
+                            # comand
+                            self.putC(byte_s, cell_e, byte)
+                            attention = 0
+                            bit_count = -1
+                        else:
+                            # data
+                            self.putD(byte_s, cell_e, byte)
                 else:
-                    if self.to_us(low_e - cell_s) < 100:
+                    if low < 100:
                         # stop-bit(0)  ___--
                         self.putT(cell_s, cell_e)
                     else:
@@ -172,15 +201,11 @@ class Decoder(srd.Decoder):
                         self.putS(low_e, cell_e)
                         bit_count = 0
             else:
+                # high >= 100
                 if self.to_us(low_e - cell_s) < 100:
+                    # low < 100
                     # ___-----
                     # stop-bit(0)
                     self.putT(cell_s, low_e)
-                #else:
-                    # _____-----
-                    # attention/SRQ
-
-                bit_count = -1
-                byte = 0
 
             cell_s = cell_e
